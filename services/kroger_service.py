@@ -21,6 +21,7 @@
 #   - Product search works today with our existing client_credentials creds.
 
 import os
+import re
 import time
 import base64
 import requests
@@ -197,18 +198,115 @@ def search_products(term: str, location_id: str | None = None, limit: int = 5) -
     return out
 
 
-def resolve_upc(term: str, location_id: str | None = None) -> dict | None:
+_IN_STOCK_LEVELS = ("HIGH", "LOW")
+
+
+def _parse_size(s: str | None) -> tuple[float, str] | None:
+    """Normalize a size string to (value, family) so sizes are comparable.
+    weight -> ('weight', oz), volume -> ('vol', fl oz), count -> ('count').
+    Returns None when nothing parseable is found.
+    """
+    if not s:
+        return None
+    sl = s.lower()
+    m = re.search(r"(\d+(?:\.\d+)?)\s*fl\.?\s*oz", sl)              # fluid ounces
+    if m:
+        return (float(m.group(1)), "vol")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(gallon|gal|qt|pt|ml|l)\b", sl)  # other volume
+    if m:
+        v, u = float(m.group(1)), m.group(2)
+        floz = {"gallon": 128, "gal": 128, "qt": 32, "pt": 16, "l": 33.814, "ml": 0.033814}[u]
+        return (v * floz, "vol")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(lbs?|oz)\b", sl)             # weight
+    if m:
+        v, u = float(m.group(1)), m.group(2)
+        return (v * (16 if u.startswith("lb") else 1), "weight")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(ct|count|pk|pack|ea)\b", sl)  # count
+    if m:
+        return (float(m.group(1)), "count")
+    return None
+
+
+def resolve_upc(term: str, location_id: str | None = None,
+                size: str | None = None) -> dict | None:
     """Return the single best product candidate (with UPC) for a basket item.
 
-    Picks the first in-stock candidate, else the first candidate. Returns None
-    when Kroger has no match; the caller decides the fallback behavior.
+    When a `size` hint is given (the flyer's product_size), pick the candidate
+    whose size is CLOSEST to it — so we match the variant the user saw, not just
+    the first result Kroger returns — with in-stock as a tie-breaker. Without a
+    size hint, prefer the first in-stock candidate. Returns None when Kroger has
+    no match.
     """
-    candidates = search_products(term, location_id=location_id, limit=5)
-    candidates = [c for c in candidates if c.get("upc")]
+    candidates = [c for c in search_products(term, location_id=location_id, limit=10)
+                  if c.get("upc")]
     if not candidates:
         return None
-    in_stock = [c for c in candidates if (c.get("stock_level") in ("HIGH", "LOW", "TEMPORARILY_OUT_OF_STOCK") )]
-    return (in_stock[0] if in_stock else candidates[0])
+
+    def in_stock(c) -> bool:
+        return c.get("stock_level") in _IN_STOCK_LEVELS
+
+    desired = _parse_size(size)
+    if desired:
+        def size_distance(c) -> float:
+            cs = _parse_size(c.get("size"))
+            if cs is None or cs[1] != desired[1]:   # unparseable or different family
+                return float("inf")
+            return abs(cs[0] - desired[0])
+        # Closest size first; among equal sizes, prefer in-stock.
+        candidates.sort(key=lambda c: (size_distance(c), 0 if in_stock(c) else 1))
+        return candidates[0]
+
+    stocked = [c for c in candidates if in_stock(c)]
+    return (stocked[0] if stocked else candidates[0])
+
+
+# Locations: resolve a real Kroger store id (locationId) from a zip + banner.
+#
+# The Products API only returns price/stock — and a store-specific assortment —
+# when you pass a real locationId. Our flyer data has a zip + banner but no
+# Kroger locationId, so we look one up here. Cached per (zip, chain).
+
+_location_cache: dict[tuple, str | None] = {}
+
+
+def find_location_id(zip_code: str, chain: str | None = None) -> str | None:
+    """Return the nearest Kroger-family store's official locationId for a zip,
+    optionally restricted to a banner via `chain` (e.g. 'RALPHS', 'FRYS').
+
+    Falls back to the nearest Kroger-family store of any banner when the chain
+    filter yields nothing. Returns None when no store is found.
+    """
+    zip_code = (zip_code or "").strip()
+    if not zip_code:
+        return None
+    chain_u = (chain or "").strip().upper() or None
+    key = (zip_code, chain_u)
+    if key in _location_cache:
+        return _location_cache[key]
+
+    headers = {"Authorization": f"Bearer {_client_credentials_token()}",
+               "Accept": "application/json"}
+
+    def _query(params: dict) -> list[dict]:
+        try:
+            resp = requests.get(f"{API_BASE}/locations", headers=headers,
+                                params=params, timeout=15)
+        except requests.RequestException:
+            return []
+        return resp.json().get("data", []) if resp.status_code == 200 else []
+
+    base = {"filter.zipCode.near": zip_code, "filter.limit": 10}
+    data = _query({**base, "filter.chain": chain_u}) if chain_u else []
+    if not data:
+        near = _query(base)
+        if chain_u:
+            data = [l for l in near if (l.get("chain") or "").upper() == chain_u] or near
+        else:
+            data = near
+
+    location_id = data[0].get("locationId") if data else None
+    _location_cache[key] = location_id
+    return location_id
 
 
 # Step 5: Add to the user's real Kroger cart
