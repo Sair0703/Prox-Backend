@@ -15,7 +15,7 @@
 
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from services import kroger_service as ks
 from services.kroger_token_store import (
@@ -142,7 +142,7 @@ class CartItemIn(BaseModel):
     # Provide either a `term` (we resolve the UPC) or a `upc` directly.
     term: str | None = None
     upc: str | None = None
-    quantity: int = 1
+    quantity: int = Field(default=1, ge=1)
     modality: str | None = None  # PICKUP | DELIVERY; defaults from service config
 
 
@@ -169,6 +169,7 @@ def kroger_cart_add(body: CartAddIn):
                 "upc": item.upc, "quantity": item.quantity,
                 "modality": item.modality or ks.DEFAULT_MODALITY,
                 "source": "upc",
+                "term": item.term,
             })
             continue
 
@@ -189,6 +190,7 @@ def kroger_cart_add(body: CartAddIn):
             "upc": match["upc"], "quantity": item.quantity,
             "modality": item.modality or ks.DEFAULT_MODALITY,
             "source": "term_match",
+            "term": item.term,
             "matched_description": match.get("description"),
             "matched_price": match.get("price"),
         })

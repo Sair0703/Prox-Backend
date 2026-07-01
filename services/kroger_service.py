@@ -248,6 +248,9 @@ def add_to_cart(user_access_token: str, items: list[dict]) -> None:
     if resp.status_code == 401:
         raise KrogerError("Kroger access token expired or invalid.", status=401,
                           detail=_safe_json(resp))
+    if resp.status_code == 403:
+        raise KrogerError("Kroger cart permission denied.", status=403,
+                          detail=_safe_json(resp))
     raise KrogerError(
         "Kroger cart add failed.",
         status=502,
