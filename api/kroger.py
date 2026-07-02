@@ -144,12 +144,16 @@ class CartItemIn(BaseModel):
     upc: str | None = None
     quantity: int = Field(default=1, ge=1)
     modality: str | None = None  # PICKUP | DELIVERY; defaults from service config
+    price: float | None = None   # the searched/flyer price, echoed back for price-change detection
+    size: str | None = None      # the flyer product_size; used to pick the closest Kroger variant
 
 
 class CartAddIn(BaseModel):
     user_id: str
     items: list[CartItemIn]
-    location_id: str | None = None  # improves UPC resolution accuracy
+    location_id: str | None = None  # explicit Kroger store id (overrides lookup)
+    zip_code: str | None = None     # used to look up a locationId when location_id is absent
+    chain: str | None = None        # Kroger banner code (RALPHS, FRYS, ...) for the lookup
 
 
 @router.post("/cart/add")
@@ -163,6 +167,13 @@ def kroger_cart_add(body: CartAddIn):
     resolved: list[dict] = []
     unresolved: list[dict] = []
 
+    # Resolve a real Kroger store id so product search returns store-specific
+    # UPC / price / stock. Prefer an explicit location_id; else look one up from
+    # the cart's zip + banner.
+    location_id = body.location_id
+    if not location_id and body.zip_code:
+        location_id = ks.find_location_id(body.zip_code, body.chain)
+
     for item in body.items:
         if item.upc:
             resolved.append({
@@ -170,6 +181,7 @@ def kroger_cart_add(body: CartAddIn):
                 "modality": item.modality or ks.DEFAULT_MODALITY,
                 "source": "upc",
                 "term": item.term,
+                "searched_price": item.price,
             })
             continue
 
@@ -178,9 +190,13 @@ def kroger_cart_add(body: CartAddIn):
             continue
 
         try:
-            match = ks.resolve_upc(item.term, location_id=body.location_id)
+            match = ks.resolve_upc(item.term, location_id=location_id, size=item.size)
         except ks.KrogerError as e:
-            raise HTTPException(status_code=e.status, detail=str(e))
+            # One bad product lookup must not abort the whole cart — skip it and
+            # report it as unresolved so the rest of the basket still goes in.
+            unresolved.append({"term": item.term,
+                               "reason": f"Kroger product search failed ({e.status})"})
+            continue
 
         if not match:
             unresolved.append({"term": item.term, "reason": "no Kroger product match"})
@@ -193,10 +209,12 @@ def kroger_cart_add(body: CartAddIn):
             "term": item.term,
             "matched_description": match.get("description"),
             "matched_price": match.get("price"),
+            "searched_price": item.price,
         })
 
     if not resolved:
         return {"added": False, "added_items": [], "unresolved": unresolved,
+                "location_id": location_id,
                 "message": "No items could be resolved to a Kroger UPC."}
 
     # Get a valid user token (refreshing if needed), add, retry once on 401.
@@ -213,4 +231,5 @@ def kroger_cart_add(body: CartAddIn):
                                 detail="Kroger session expired mid-request. Please reconnect.")
         raise HTTPException(status_code=e.status, detail=str(e))
 
-    return {"added": True, "added_items": resolved, "unresolved": unresolved}
+    return {"added": True, "added_items": resolved, "unresolved": unresolved,
+            "location_id": location_id}
