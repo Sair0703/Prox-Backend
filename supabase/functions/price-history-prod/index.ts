@@ -28,7 +28,7 @@ type UpsertResult = {
 
 const TARGET_TABLE = "price_history";
 const WRITE_BATCH = 2000;
-const DEFAULT_BATCH_SIZE = 1000;
+const DEFAULT_BATCH_SIZE = 2000;
 const MAX_BATCH_SIZE = 10000;
 const MAX_RETRIES = 3;
 const MAX_PRICE = 999999;
