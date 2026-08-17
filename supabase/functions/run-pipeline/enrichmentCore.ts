@@ -1789,23 +1789,19 @@ export function enrichRow(row: RawRow, context: EnrichmentContext): EnrichedRow 
   // ---- 4. Organic ----
   const is_organic: boolean = detectOrganic(productName, brand, row.product_description);
 
-  // ---- 5. Brand-category cross-validation ----
+  // ---- 5. Brand-category cross-validation (advisory only) ----
+  // Brand data no longer participates in the category decision. A brand-level category
+  // was overwriting the product-level result at ~34% accuracy on ~18.6% of processed rows,
+  // because brands span categories (4C is Parmesan and drink mixes) and some extracted
+  // "brands" are generic words like Fresh or Premium. The agreement signal is still
+  // recorded in brand_category_match so the brand table can keep being measured.
   const validation = validateBrandCategory(brand, is_brand === true, category, context.brandCategoryMap, productName ?? undefined);
   const brand_category_match = validation.brandCategoryMatch;
-  let brandCategoryFlag = false;
-  let categorySource: string = category !== ProductCategory.CATEGORY_UNCERTAIN ? "deterministic" : "none";
-  let categoryConfidence: number | null = category !== ProductCategory.CATEGORY_UNCERTAIN ? 1.0 : null;
+  const categorySource: string = category !== ProductCategory.CATEGORY_UNCERTAIN ? "deterministic" : "none";
+  const categoryConfidence: number | null = category !== ProductCategory.CATEGORY_UNCERTAIN ? 1.0 : null;
 
-  if (validation.shouldFlag) {
-    brandCategoryFlag = true;
-    if (validation.suggestedCategory) {
-      category = validation.suggestedCategory;
-      categorySource = "brand";
-      categoryConfidence = 1.0;
-    }
-  }
-
-  const finalCategoryFlag = categoryFlag || brandCategoryFlag;
+  // Only the categorizer's own uncertainty flags a row now; brand disagreement does not.
+  const finalCategoryFlag = categoryFlag;
 
   // ---- 6. Parse and normalize size ----
   let display_size: string | null = null;
