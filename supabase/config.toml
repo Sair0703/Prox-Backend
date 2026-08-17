@@ -2,7 +2,7 @@
 # https://supabase.com/docs/guides/local-development/cli/config
 # A string used to distinguish different Supabase projects on the same host. Defaults to the
 # working directory name when running `supabase init`.
-project_id = "Prox-Backend"
+project_id = "yhyaslxqzwqptknmybqa"
 
 [api]
 enabled = true
@@ -411,3 +411,63 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 # declarative_schema_path = "./database"
 # JSON string passed through to pg-delta SQL formatting.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
+
+# ---------------------------------------------------------------------------
+# Deployed verify_jwt settings, captured from the live project on 2026-08-17.
+# verify_jwt lives on the deployment, not in the function source, so a deploy
+# from this repo would otherwise default every function to true and start
+# rejecting unauthenticated callers. Regenerate with:
+#   supabase functions list --output-format json | ... select verify_jwt == false
+# ---------------------------------------------------------------------------
+
+[functions.cartai-checkout]
+verify_jwt = false
+
+[functions.cartai-webhook]
+verify_jwt = false
+
+[functions.chat-deals]
+verify_jwt = false
+
+[functions.check-subscription]
+verify_jwt = false
+
+[functions.complete-waitlist-signup]
+verify_jwt = false
+
+[functions.confirm-email-link]
+verify_jwt = false
+
+[functions.create-checkout]
+verify_jwt = false
+
+[functions.customer-portal]
+verify_jwt = false
+
+[functions.notify-admin-signup]
+verify_jwt = false
+
+[functions.run-pipeline]
+verify_jwt = false
+
+[functions.send-email-hook]
+verify_jwt = false
+
+[functions.send-password-reset]
+verify_jwt = false
+
+[functions.send-signup-confirmation]
+verify_jwt = false
+
+[functions.send-signup-email]
+verify_jwt = false
+
+[functions.send-welcome-email]
+verify_jwt = false
+
+[functions.unsubscribe]
+verify_jwt = false
+
+[functions.verify-reset-token]
+verify_jwt = false
+
