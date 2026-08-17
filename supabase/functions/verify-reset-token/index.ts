@@ -12,7 +12,26 @@ const corsHeaders = {
 
 interface ResetPasswordRequest {
   token: string;
-  newPassword: string;
+  newPassword?: string;
+}
+
+// Find a user by their custom reset_token, scanning ALL users (paginated).
+// The previous version only checked the first 50 users, so resets failed for
+// most of the user base once it grew past that.
+async function findUserByResetToken(supabaseAdmin: any, token: string) {
+  const perPage = 1000;
+  let page = 1;
+  while (page <= 50) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const users = data?.users || [];
+    if (users.length === 0) break;
+    const match = users.find((u: any) => u.user_metadata?.reset_token === token);
+    if (match) return match;
+    if (users.length < perPage) break;
+    page++;
+  }
+  return null;
 }
 
 const handler = async (req: Request): Promise<Response> => {
@@ -23,76 +42,52 @@ const handler = async (req: Request): Promise<Response> => {
   try {
     const { token, newPassword }: ResetPasswordRequest = await req.json();
 
-    if (!token || !newPassword) {
+    if (!token) {
       return new Response(
-        JSON.stringify({ error: "Token and new password are required" }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
+        JSON.stringify({ valid: false, error: "Reset token is required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
     }
-
-    console.log("Password reset verification requested");
 
     const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
+      auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Find user with matching reset token
-    const { data: { users }, error: listError } = await supabaseAdmin.auth.admin.listUsers();
-    
-    if (listError) {
-      console.error("Error listing users:", listError);
-      throw listError;
-    }
+    const user = await findUserByResetToken(supabaseAdmin, token);
 
-    const user = users?.find(u => {
-      const resetToken = u.user_metadata?.reset_token;
-      const expiresAt = u.user_metadata?.reset_token_expires;
-      
-      if (!resetToken || !expiresAt) return false;
-      
-      const isTokenMatch = resetToken === token;
-      const isNotExpired = new Date(expiresAt) > new Date();
-      
-      return isTokenMatch && isNotExpired;
-    });
+    // Token must exist and not be expired.
+    const expiresAt = user?.user_metadata?.reset_token_expires;
+    const isNotExpired = expiresAt ? new Date(expiresAt) > new Date() : false;
+    const isValid = !!user && isNotExpired;
 
-    if (!user) {
-      console.log("Invalid or expired token");
+    if (!isValid) {
       return new Response(
-        JSON.stringify({ error: "Invalid or expired reset token" }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
+        JSON.stringify({ valid: false, error: "This reset link is invalid or has expired." }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
     }
 
-    // Update the password
+    // Validate-only mode: the "Verifying your reset link..." screen can call this
+    // with just the token to check the link before showing the new-password form.
+    // The token stays usable so the user can submit their password next.
+    if (!newPassword) {
+      return new Response(
+        JSON.stringify({ valid: true, message: "Reset link is valid" }),
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Update the password. We intentionally do NOT clear the reset token here, so
+    // the same link keeps working on repeated clicks until it naturally expires (24h).
     const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
       user.id,
-      {
-        password: newPassword,
-        user_metadata: {
-          reset_token: null,
-          reset_token_expires: null,
-        }
-      }
+      { password: newPassword }
     );
-
-    if (updateError) {
-      console.error("Error updating password:", updateError);
-      throw updateError;
-    }
+    if (updateError) throw updateError;
 
     console.log("Password updated successfully for user:", user.email);
 
-    // Check if user is in waitlist and migrate to profiles
+    // Migrate waitlist -> profiles if applicable (guarded so repeat calls are safe).
     try {
       const { data: waitlistUser, error: waitlistError } = await supabaseAdmin
         .from('waitlist')
@@ -101,14 +96,10 @@ const handler = async (req: Request): Promise<Response> => {
         .maybeSingle();
 
       if (!waitlistError && waitlistUser) {
-        console.log("Found waitlist user, migrating to profiles");
-
-        // Split name into first and last name (if possible)
         const nameParts = waitlistUser.name?.trim().split(' ') || [];
         const firstName = nameParts[0] || '';
         const lastName = nameParts.slice(1).join(' ') || '';
 
-        // Check if profile already exists
         const { data: existingProfile } = await supabaseAdmin
           .from('profiles')
           .select('id')
@@ -116,7 +107,6 @@ const handler = async (req: Request): Promise<Response> => {
           .maybeSingle();
 
         if (!existingProfile) {
-          // Create profile with waitlist data
           const { error: profileError } = await supabaseAdmin
             .from('profiles')
             .insert({
@@ -128,51 +118,29 @@ const handler = async (req: Request): Promise<Response> => {
               preferred_retailers: waitlistUser.preferred_retailers,
               app_preference: waitlistUser.device_preference || 'web',
             });
-
           if (profileError) {
             console.error("Error creating profile from waitlist:", profileError);
           } else {
-            console.log("Successfully migrated waitlist user to profiles");
-
-            // Mark waitlist entry as converted by adding user_id
             await supabaseAdmin
               .from('waitlist')
               .update({ user_id: user.id })
               .eq('email', user.email);
           }
-        } else {
-          console.log("Profile already exists, skipping migration");
         }
       }
     } catch (migrationError) {
       console.error("Error during waitlist migration:", migrationError);
-      // Don't fail the password reset if migration fails
     }
 
     return new Response(
-      JSON.stringify({ 
-        success: true,
-        message: "Password updated successfully" 
-      }),
-      {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-          ...corsHeaders,
-        },
-      }
+      JSON.stringify({ success: true, valid: true, message: "Password updated successfully" }),
+      { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
     );
   } catch (error: any) {
     console.error("Error in verify-reset-token function:", error);
     return new Response(
-      JSON.stringify({ 
-        error: error.message,
-        success: false 
-      }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
-      }
+      JSON.stringify({ error: error.message, success: false }),
+      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
     );
   }
 };
