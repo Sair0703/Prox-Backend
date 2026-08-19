@@ -6,6 +6,7 @@ logger = logging.getLogger(__name__)
 
 TABLE      = "price_history"
 BATCH_SIZE = 500
+MAX_ALIAS_DEPTH = 8
 
 
 def upsert_price_history(rows: list[dict]) -> int:
@@ -23,14 +24,11 @@ def upsert_price_history(rows: list[dict]) -> int:
     return written
 
 
-def _match_key_variants(match_key: str) -> list[str]:
-    """Return all format variants of a match_key to try in order.
+def _legacy_format_variants(match_key: str) -> list[str]:
+    """Return historical casing/size variants for a legacy v1 match key."""
+    if match_key.startswith("v2|"):
+        return [match_key]
 
-    Handles two historical format mismatches:
-    - Brand casing: 'Carolina|...|32' vs 'carolina|...|32'
-    - Size field: '...|32' vs '...|no_size'
-    - Numeric size formatting: '...|80' vs '...|80.0'
-    """
     parts = match_key.rsplit("|", 1)
     if len(parts) != 2:
         return [match_key]
@@ -60,13 +58,79 @@ def _match_key_variants(match_key: str) -> list[str]:
     if brand_lower != brand:
         brands.append(brand_lower)
 
-    variants = []
+    variants: list[str] = []
     for variant_size in sizes:
         for variant_brand in brands:
             variant = f"{variant_brand}|{canonical}|{variant_size}"
             if variant not in variants:
                 variants.append(variant)
     return variants
+
+
+def _alias_history_keys(match_key: str) -> list[str]:
+    """Return safe current + historical keys for one product identity.
+
+    Forward resolution is only followed when the legacy key has exactly one
+    terminal successor. Reverse traversal only follows aliases marked as a
+    unique successor. Ambiguous legacy keys therefore stay on their original
+    history instead of being copied across multiple v2 products.
+    """
+    client = get_supabase_client()
+    resolved_key = match_key
+
+    try:
+        resolved_rows = client.rpc(
+            "resolve_match_key_v2",
+            {"p_match_key": match_key, "p_max_depth": MAX_ALIAS_DEPTH},
+        ).execute().data or []
+        if resolved_rows:
+            terminal_count = int(resolved_rows[0].get("terminal_count") or 0)
+            if terminal_count == 1:
+                resolved_key = resolved_rows[0].get("resolved_match_key") or match_key
+    except Exception as exc:
+        logger.debug("match-key v2 forward resolution unavailable: %s", exc)
+        return [match_key]
+
+    keys = [resolved_key]
+    seen = {resolved_key}
+    frontier = [resolved_key]
+
+    try:
+        for _ in range(MAX_ALIAS_DEPTH):
+            if not frontier:
+                break
+            rows = (
+                client.table("match_key_aliases_v2")
+                .select("old_match_key")
+                .in_("new_match_key", frontier)
+                .eq("is_unique_successor", True)
+                .execute()
+                .data or []
+            )
+            next_frontier: list[str] = []
+            for row in rows:
+                old_key = row.get("old_match_key")
+                if old_key and old_key not in seen:
+                    seen.add(old_key)
+                    keys.append(old_key)
+                    next_frontier.append(old_key)
+            frontier = next_frontier
+    except Exception as exc:
+        logger.debug("match-key v2 reverse alias lookup unavailable: %s", exc)
+
+    if match_key not in seen:
+        keys.append(match_key)
+    return keys
+
+
+def _match_key_variants(match_key: str) -> list[str]:
+    """Return safe v2 aliases plus legacy format variants in lookup order."""
+    variants: list[str] = []
+    for alias_key in _alias_history_keys(match_key):
+        for candidate in _legacy_format_variants(alias_key):
+            if candidate not in variants:
+                variants.append(candidate)
+    return variants or [match_key]
 
 
 def _query_history(client, key: str, store_id: str, since: str) -> list[dict]:
@@ -93,10 +157,9 @@ def get_baseline_price(match_key: str, store_id: str, days: int = 90) -> float |
     history = get_price_history(match_key, store_id, days)
     if not history:
         return None
-    # Group by date (truncate timestamp to date) and take daily min
     by_date: dict[str, list[float]] = {}
     for row in history:
-        day = row["observed_at"][:10]  # "2026-03-23T..." → "2026-03-23"
+        day = row["observed_at"][:10]
         by_date.setdefault(day, []).append(float(row["product_price"]))
     daily_mins = [min(prices) for prices in by_date.values()]
     return round(sum(daily_mins) / len(daily_mins), 2)
@@ -104,14 +167,17 @@ def get_baseline_price(match_key: str, store_id: str, days: int = 90) -> float |
 
 def get_latest_price(match_key: str, store_id: str) -> dict | None:
     client = get_supabase_client()
-    res    = client.table(TABLE)\
-        .select("product_price, observed_at, flyer_id")\
-        .eq("match_key", match_key)\
-        .eq("store_id", store_id)\
-        .order("observed_at", desc=True)\
-        .limit(1)\
-        .execute()
-    return res.data[0] if res.data else None
+    for key in _match_key_variants(match_key):
+        res = client.table(TABLE)\
+            .select("product_price, observed_at, flyer_id")\
+            .eq("match_key", key)\
+            .eq("store_id", store_id)\
+            .order("observed_at", desc=True)\
+            .limit(1)\
+            .execute()
+        if res.data:
+            return res.data[0]
+    return None
 
 
 def get_all_match_key_store_pairs() -> list[dict]:
