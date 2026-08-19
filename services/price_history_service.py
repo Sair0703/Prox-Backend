@@ -26,7 +26,7 @@ def upsert_price_history(rows: list[dict]) -> int:
 
 def _legacy_format_variants(match_key: str) -> list[str]:
     """Return historical casing/size variants for a legacy v1 match key."""
-    if match_key.startswith("v2|"):
+    if match_key.startswith(("v2|", "v3|")):
         return [match_key]
 
     parts = match_key.rsplit("|", 1)
@@ -68,16 +68,29 @@ def _legacy_format_variants(match_key: str) -> list[str]:
 
 
 def _alias_history_keys(match_key: str) -> list[str]:
-    """Return safe current + historical keys for one product identity.
+    """Return terminal-safe current + historical keys for one product identity.
 
-    Forward resolution is only followed when the legacy key has exactly one
-    terminal successor. Reverse traversal only follows aliases marked as a
-    unique successor. Ambiguous legacy keys therefore stay on their original
-    history instead of being copied across multiple v2 products.
+    Supabase owns alias-graph resolution so v1 -> v2 -> v3 transitions and
+    converging presentation-only aliases are evaluated consistently. A legacy
+    key is only walked backward into a current product when it has exactly one
+    terminal successor. True multi-product legacy collisions remain isolated.
     """
     client = get_supabase_client()
-    resolved_key = match_key
 
+    try:
+        rows = client.rpc(
+            "get_match_key_history_keys_v3",
+            {"p_match_key": match_key, "p_max_depth": MAX_ALIAS_DEPTH},
+        ).execute().data or []
+        keys = [row.get("match_key") for row in rows if row.get("match_key")]
+        if keys:
+            return list(dict.fromkeys(keys))
+    except Exception as exc:
+        logger.debug("terminal-safe match-key history resolver unavailable: %s", exc)
+
+    # Backward-compatible fallback for deployments where the helper RPC has not
+    # reached the API process yet. This preserves the previous v2 behavior.
+    resolved_key = match_key
     try:
         resolved_rows = client.rpc(
             "resolve_match_key_v2",
@@ -88,13 +101,12 @@ def _alias_history_keys(match_key: str) -> list[str]:
             if terminal_count == 1:
                 resolved_key = resolved_rows[0].get("resolved_match_key") or match_key
     except Exception as exc:
-        logger.debug("match-key v2 forward resolution unavailable: %s", exc)
+        logger.debug("match-key forward resolution unavailable: %s", exc)
         return [match_key]
 
     keys = [resolved_key]
     seen = {resolved_key}
     frontier = [resolved_key]
-
     try:
         for _ in range(MAX_ALIAS_DEPTH):
             if not frontier:
@@ -116,7 +128,7 @@ def _alias_history_keys(match_key: str) -> list[str]:
                     next_frontier.append(old_key)
             frontier = next_frontier
     except Exception as exc:
-        logger.debug("match-key v2 reverse alias lookup unavailable: %s", exc)
+        logger.debug("match-key reverse alias fallback unavailable: %s", exc)
 
     if match_key not in seen:
         keys.append(match_key)
@@ -124,7 +136,7 @@ def _alias_history_keys(match_key: str) -> list[str]:
 
 
 def _match_key_variants(match_key: str) -> list[str]:
-    """Return safe v2 aliases plus legacy format variants in lookup order."""
+    """Return safe v3/v2 aliases plus legacy format variants in lookup order."""
     variants: list[str] = []
     for alias_key in _alias_history_keys(match_key):
         for candidate in _legacy_format_variants(alias_key):
