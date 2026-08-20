@@ -97,12 +97,26 @@ def complete(
     )
 
 
-def classify_and_finalize(source_product_id: int) -> None:
-    rpc(
-        "v2_classify_source_products_range_v27",
-        {"p_min_id": source_product_id, "p_max_id": source_product_id},
+def cancel_classifier(lease_token: str) -> Any:
+    return rpc(
+        "v27_cancel_classification_lease",
+        {"p_lease_token": lease_token},
+        5.0,
+    )
+
+
+def classify_and_finalize(source_product_id: int, lease_token: str) -> None:
+    result = rpc(
+        "v27_classify_leased_source_product",
+        {
+            "p_source_product_id": source_product_id,
+            "p_lease_token": lease_token,
+        },
         CLASSIFY_TIMEOUT_SECONDS,
     )
+    if not isinstance(result, dict) or result.get("status") != "classified":
+        raise RuntimeError(f"classifier lease rejected: {result}")
+
     rpc(
         "v27_finalize_source_product_incremental",
         {"p_source_product_id": source_product_id},
@@ -131,12 +145,12 @@ def worker_loop(slot: int) -> None:
         started = time.monotonic()
 
         try:
-            classify_and_finalize(source_product_id)
+            classify_and_finalize(source_product_id, lease_token)
             complete(
                 source_product_id,
                 lease_token,
                 "done",
-                note="external_worker_classified_and_finalized",
+                note="external_worker_classified_and_finalized_cancel_safe",
             )
             logger.info(
                 "done source_product_id=%s elapsed=%.2fs",
@@ -146,17 +160,30 @@ def worker_loop(slot: int) -> None:
 
         except httpx.TimeoutException as exc:
             logger.warning(
-                "timeout source_product_id=%s elapsed=%.2fs",
+                "timeout source_product_id=%s elapsed=%.2fs; requesting database cancel",
                 source_product_id,
                 time.monotonic() - started,
             )
+            try:
+                cancel_result = cancel_classifier(lease_token)
+                logger.info(
+                    "cancel source_product_id=%s result=%s",
+                    source_product_id,
+                    cancel_result,
+                )
+            except Exception:
+                logger.exception(
+                    "database cancel request failed source_product_id=%s",
+                    source_product_id,
+                )
+
             try:
                 complete(
                     source_product_id,
                     lease_token,
                     "retry",
                     error=f"external_timeout:{type(exc).__name__}",
-                    note="external_worker_timeout",
+                    note="external_worker_timeout_cancel_requested",
                 )
             except Exception:
                 logger.exception(
