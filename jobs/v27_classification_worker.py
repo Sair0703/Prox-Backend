@@ -17,15 +17,32 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise EnvironmentError("SUPABASE_URL and SUPABASE_KEY must be set")
 
-CONCURRENCY = max(1, int(os.getenv("V27_WORKER_CONCURRENCY", "8")))
-CLASSIFY_TIMEOUT_SECONDS = float(os.getenv("V27_CLASSIFY_TIMEOUT_SECONDS", "8"))
+WORKER_LANE = os.getenv("V27_WORKER_LANE", "normal").strip().lower()
+if WORKER_LANE not in {"normal", "slow"}:
+    raise ValueError("V27_WORKER_LANE must be 'normal' or 'slow'")
+
+DEFAULT_CONCURRENCY = "2" if WORKER_LANE == "slow" else "8"
+DEFAULT_CLASSIFY_TIMEOUT = "30" if WORKER_LANE == "slow" else "8"
+DEFAULT_LEASE_SECONDS = "180" if WORKER_LANE == "slow" else "120"
+DEFAULT_RETRY_SECONDS = "300" if WORKER_LANE == "slow" else "60"
+
+CONCURRENCY = max(1, int(os.getenv("V27_WORKER_CONCURRENCY", DEFAULT_CONCURRENCY)))
+CLASSIFY_TIMEOUT_SECONDS = float(
+    os.getenv("V27_CLASSIFY_TIMEOUT_SECONDS", DEFAULT_CLASSIFY_TIMEOUT)
+)
 FINALIZE_TIMEOUT_SECONDS = float(os.getenv("V27_FINALIZE_TIMEOUT_SECONDS", "30"))
-LEASE_SECONDS = max(30, int(os.getenv("V27_LEASE_SECONDS", "120")))
+LEASE_SECONDS = max(
+    30, int(os.getenv("V27_LEASE_SECONDS", DEFAULT_LEASE_SECONDS))
+)
 MAX_ATTEMPTS = max(1, int(os.getenv("V27_MAX_ATTEMPTS", "3")))
-RETRY_SECONDS = max(1, int(os.getenv("V27_RETRY_SECONDS", "60")))
+RETRY_SECONDS = max(
+    1, int(os.getenv("V27_RETRY_SECONDS", DEFAULT_RETRY_SECONDS))
+)
 IDLE_SLEEP_SECONDS = float(os.getenv("V27_IDLE_SLEEP_SECONDS", "1"))
 
-WORKER_INSTANCE = os.getenv("V27_WORKER_NAME", f"{socket.gethostname()}-{os.getpid()}")
+WORKER_INSTANCE = os.getenv(
+    "V27_WORKER_NAME", f"{socket.gethostname()}-{os.getpid()}"
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -65,8 +82,13 @@ def rpc(name: str, payload: dict[str, Any], timeout_seconds: float) -> Any:
 
 
 def claim_one(worker_name: str) -> dict[str, Any] | None:
+    claim_rpc = (
+        "v27_claim_one_slow_classification_item"
+        if WORKER_LANE == "slow"
+        else "v27_claim_one_classification_item"
+    )
     result = rpc(
-        "v27_claim_one_classification_item",
+        claim_rpc,
         {"p_worker": worker_name, "p_lease_seconds": LEASE_SECONDS},
         10.0,
     )
@@ -105,7 +127,7 @@ def cancel_classifier(lease_token: str) -> Any:
     )
 
 
-def classify_and_finalize(source_product_id: int, lease_token: str) -> None:
+def classify_and_finalize(source_product_id: int, lease_token: str) -> str:
     result = rpc(
         "v27_classify_leased_source_product",
         {
@@ -114,7 +136,12 @@ def classify_and_finalize(source_product_id: int, lease_token: str) -> None:
         },
         CLASSIFY_TIMEOUT_SECONDS,
     )
-    if not isinstance(result, dict) or result.get("status") != "classified":
+    accepted_statuses = {
+        "classified",
+        "classified_fast_signature",
+        "classified_fast_exact_alias",
+    }
+    if not isinstance(result, dict) or result.get("status") not in accepted_statuses:
         raise RuntimeError(f"classifier lease rejected: {result}")
 
     rpc(
@@ -122,17 +149,34 @@ def classify_and_finalize(source_product_id: int, lease_token: str) -> None:
         {"p_source_product_id": source_product_id},
         FINALIZE_TIMEOUT_SECONDS,
     )
+    return str(result.get("status"))
 
 
 def worker_loop(slot: int) -> None:
-    worker_name = f"{WORKER_INSTANCE}-slot{slot:02d}"
-    logger.info("worker started name=%s", worker_name)
+    worker_name = f"{WORKER_INSTANCE}-{WORKER_LANE}-slot{slot:02d}"
+    logger.info("worker started name=%s lane=%s", worker_name, WORKER_LANE)
+
+    done_note = (
+        "external_slow_worker_classified_and_finalized"
+        if WORKER_LANE == "slow"
+        else "external_worker_classified_and_finalized_cancel_safe"
+    )
+    timeout_note = (
+        "external_slow_worker_timeout_cancel_requested"
+        if WORKER_LANE == "slow"
+        else "external_worker_timeout_cancel_requested"
+    )
+    error_note = (
+        "external_slow_worker_error"
+        if WORKER_LANE == "slow"
+        else "external_worker_error"
+    )
 
     while True:
         try:
             claim = claim_one(worker_name)
         except Exception:
-            logger.exception("claim failed")
+            logger.exception("claim failed lane=%s", WORKER_LANE)
             time.sleep(3)
             continue
 
@@ -145,35 +189,40 @@ def worker_loop(slot: int) -> None:
         started = time.monotonic()
 
         try:
-            classify_and_finalize(source_product_id, lease_token)
+            classifier_status = classify_and_finalize(source_product_id, lease_token)
             complete(
                 source_product_id,
                 lease_token,
                 "done",
-                note="external_worker_classified_and_finalized_cancel_safe",
+                note=done_note,
             )
             logger.info(
-                "done source_product_id=%s elapsed=%.2fs",
+                "done lane=%s source_product_id=%s classifier_status=%s elapsed=%.2fs",
+                WORKER_LANE,
                 source_product_id,
+                classifier_status,
                 time.monotonic() - started,
             )
 
         except httpx.TimeoutException as exc:
             logger.warning(
-                "timeout source_product_id=%s elapsed=%.2fs; requesting database cancel",
+                "timeout lane=%s source_product_id=%s elapsed=%.2fs; requesting database cancel",
+                WORKER_LANE,
                 source_product_id,
                 time.monotonic() - started,
             )
             try:
                 cancel_result = cancel_classifier(lease_token)
                 logger.info(
-                    "cancel source_product_id=%s result=%s",
+                    "cancel lane=%s source_product_id=%s result=%s",
+                    WORKER_LANE,
                     source_product_id,
                     cancel_result,
                 )
             except Exception:
                 logger.exception(
-                    "database cancel request failed source_product_id=%s",
+                    "database cancel request failed lane=%s source_product_id=%s",
+                    WORKER_LANE,
                     source_product_id,
                 )
 
@@ -183,43 +232,51 @@ def worker_loop(slot: int) -> None:
                     lease_token,
                     "retry",
                     error=f"external_timeout:{type(exc).__name__}",
-                    note="external_worker_timeout_cancel_requested",
+                    note=timeout_note,
                 )
             except Exception:
                 logger.exception(
-                    "failed to record timeout source_product_id=%s; lease will expire",
+                    "failed to record timeout lane=%s source_product_id=%s; lease will expire",
+                    WORKER_LANE,
                     source_product_id,
                 )
 
         except Exception as exc:
-            logger.exception("classification failed source_product_id=%s", source_product_id)
+            logger.exception(
+                "classification failed lane=%s source_product_id=%s",
+                WORKER_LANE,
+                source_product_id,
+            )
             try:
                 complete(
                     source_product_id,
                     lease_token,
                     "retry",
                     error=f"external_error:{type(exc).__name__}:{str(exc)[:700]}",
-                    note="external_worker_error",
+                    note=error_note,
                 )
             except Exception:
                 logger.exception(
-                    "failed to record error source_product_id=%s; lease will expire",
+                    "failed to record error lane=%s source_product_id=%s; lease will expire",
+                    WORKER_LANE,
                     source_product_id,
                 )
 
 
 def main() -> None:
     logger.info(
-        "starting v2.7 worker instance=%s concurrency=%s classify_timeout=%ss lease=%ss",
+        "starting v2.7 worker instance=%s lane=%s concurrency=%s classify_timeout=%ss lease=%ss retry=%ss",
         WORKER_INSTANCE,
+        WORKER_LANE,
         CONCURRENCY,
         CLASSIFY_TIMEOUT_SECONDS,
         LEASE_SECONDS,
+        RETRY_SECONDS,
     )
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=CONCURRENCY,
-        thread_name_prefix="v27",
+        thread_name_prefix=f"v27-{WORKER_LANE}",
     ) as pool:
         futures = [pool.submit(worker_loop, i + 1) for i in range(CONCURRENCY)]
         for future in futures:
