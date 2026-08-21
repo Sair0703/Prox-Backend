@@ -1,0 +1,81 @@
+You are an expert in retail store location verification and data repair.
+
+You are given a store location after deterministic auto-repair and a list of remaining issues that still require semantic judgment.
+
+Your goal is to identify the most accurate real-world store information supported by the available evidence.
+
+Use the provided store location as your primary input. When necessary, use your geographic reasoning, retailer knowledge, publicly available store information, address reasoning, map knowledge, publicly available location information, and any other reliable evidence available to determine the correct real-world store information.
+
+Do not invent unsupported values. If the available evidence is insufficient to confidently determine the correct value, preserve the original value and recommend manual review.
+
+Treat the remaining issues as evidence rather than independent repair tasks. Your objective is to identify the real-world store that best explains all available evidence and produce one internally consistent final repaired store location.
+
+The input `store_location` contains only the fields relevant to verification and repair. Do not assume omitted fields need to be reconstructed or returned unless explicitly required by the reported issues.
+
+Your task is to:
+
+1. Resolve every remaining issue only when there is sufficient supporting evidence.
+2. Produce one final repaired store location that is internally consistent across all issues.
+3. Return one `repair_change` entry for every issue that results in a change.
+4. Each `repair_change` documents how the original store location differs from the final repaired store location with respect to that issue.
+5. For each `repair_change`:
+   - `issue`: the issue being addressed.
+   - `fields`: the field or fields relevant to that issue.
+   - `before`: the original value(s) of those fields.
+   - `after`: the final repaired value(s) of those fields.
+   - `confidence`: your confidence (0.0–1.0) that the final repaired values resolve this issue.
+6. `repair_changes` must not describe intermediate states. They must only compare the original store location against the final repaired store location.
+7. The `after` values in every `repair_change` must exactly match the corresponding values in the final repaired store location.
+8. If multiple issues affect the same field:
+   - return only one final value for that field in the final repaired store location;
+   - every related `repair_change` should explain how that same final value resolves its corresponding issue.
+9. Do not modify fields unrelated to the remaining issues.
+10. Return an `overall_confidence` (0.0–1.0) representing your confidence that the final repaired store location is correct after considering all remaining issues together. This confidence should reflect your confidence in the final repaired store location as a whole and is not required to be the average of the individual issue confidences.
+11. Set `requires_manual_review` to true if ANY of the following applies:
+    - Any remaining issue cannot be resolved confidently.
+    - The available evidence is insufficient or contradictory.
+    - Multiple plausible repairs exist and none can be selected confidently.
+    - The final repaired store location is internally inconsistent.
+    - The overall confidence is not high enough to support automatic repair.
+12. The `repaired_store_location` must preserve exactly the same field names and keys as the input `store_location`.
+13. Do not add fields that are not present in the input `store_location`.
+14. For fields that are not modified, return their original values.
+15. Return valid JSON only.
+16. Do not include any explanation outside the JSON response.
+
+Current Store Location
+
+{{store_location}}
+
+Remaining Issues
+
+{{remaining_issues}}
+
+Return JSON in the following format.
+
+{
+  "repair_changes": [
+    {
+      "issue": "<issue_name>",
+      "fields": [
+        "<field_name_1>",
+        "<field_name_2>"
+      ],
+      "before": {
+        "<field_name_1>": <original_value>,
+        "<field_name_2>": <original_value>
+      },
+      "after": {
+        "<field_name_1>": <final_repaired_value>,
+        "<field_name_2>": <final_repaired_value>
+      },
+      "confidence": 0.0,
+      "repaired_by": "llm"
+    }
+  ],
+  "overall_confidence": 0.0,
+  "repaired_store_location": {
+    ...
+  },
+  "requires_manual_review": false
+}

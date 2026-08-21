@@ -18,7 +18,7 @@ RATE_LIMIT = 0.05
 
 def _build_match_payload(match) -> dict:
     return {
-        "store_id":              match.store_id,
+        "store_id":              match.retailer_store_id,
         "match_confidence":      match.match_confidence,
         "candidate_store_count": match.candidate_store_count,
         "matched_by":            match.matched_by,
