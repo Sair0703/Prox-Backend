@@ -1,0 +1,44 @@
+name: Run Full Pipeline
+
+on:
+  workflow_dispatch:  # allows manual trigger
+  repository_dispatch:
+    types: [run_pipeline]  # triggered by webhook from Supabase
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run full pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ONESIGNAL_APP_ID: ${{ secrets.ONESIGNAL_APP_ID }}
+          ONESIGNAL_API_KEY: ${{ secrets.ONESIGNAL_API_KEY }}
+        run: |
+          PYTHONUTF8=1 PYTHONPATH=. python scripts/run_full_pipeline.py
+          - name: Notify Slack on success
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"✅ Pipeline completed successfully!"}' \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"❌ Pipeline failed! Check GitHub Actions for details."}' \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
