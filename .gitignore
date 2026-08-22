@@ -9,12 +9,3 @@ __pycache__/
 
 .kroger_tokens.json
 .kroger_tokens.json.tmp
-
-.giant_chrome_profile/
-.giant_company_chrome_profile/
-.playwright-samsclub-profile/
-
-services/store_service/**/_*/
-
-data/geocode_cache.json
-debug/
