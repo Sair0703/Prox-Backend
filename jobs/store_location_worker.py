@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 
 from config.supabase import supabase
 from jobs.backfill_store_ids import run_backfill
-from services.store_location_matcher import SOURCE_RETAILER_KEY_OVERRIDES
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -20,7 +19,6 @@ logging.basicConfig(
 logger = logging.getLogger("STORE_LOCATION_WORKER")
 
 LOCAL_TZ = ZoneInfo(os.getenv("STORE_LOCATION_WEEK_TIMEZONE", "America/Los_Angeles"))
-STORE_KEY_PAGE_SIZE = 1000
 ACTIVE_SLEEP_SECONDS = float(os.getenv("STORE_LOCATION_ACTIVE_SLEEP_SECONDS", "5"))
 IDLE_SLEEP_SECONDS = float(os.getenv("STORE_LOCATION_IDLE_SLEEP_SECONDS", "300"))
 ERROR_SLEEP_SECONDS = float(os.getenv("STORE_LOCATION_ERROR_SLEEP_SECONDS", "15"))
@@ -44,97 +42,70 @@ def latest_wednesday_start_utc(now: datetime | None = None) -> datetime:
     return start_local.astimezone(timezone.utc)
 
 
-def load_store_retailer_keys() -> set[str]:
-    keys: set[str] = set()
-    offset = 0
+def _week_start_id(week_start: datetime) -> int:
+    """Return an ID cursor just before the first row created this flyer week.
 
-    while True:
-        result = (
-            supabase.table("store_locations")
-            .select("retailer_key")
-            .order("id")
-            .range(offset, offset + STORE_KEY_PAGE_SIZE - 1)
-            .execute()
-        )
-        page = result.data or []
-        for row in page:
-            key = str(row.get("retailer_key") or "").strip().lower()
-            if key:
-                keys.add(key)
+    The backfill table already has a partial index on id WHERE store_id IS NULL.
+    Scanning unmatched rows forward from the weekly ID boundary is dramatically
+    cheaper than issuing one retailer_key-filtered query per retailer, because
+    retailer_key currently has no supporting backfill index.
+    """
+    result = (
+        supabase.table("flyer_deals")
+        .select("id,created_at")
+        .gte("created_at", week_start.isoformat())
+        .order("created_at")
+        .order("id")
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        return 0
 
-        if len(page) < STORE_KEY_PAGE_SIZE:
-            break
-        offset += STORE_KEY_PAGE_SIZE
-
-    return keys
-
-
-def source_keys_to_process(store_keys: set[str]) -> list[str]:
-    # Normal source keys match store keys. Versioned source keys are explicitly
-    # added only when their target store key exists.
-    keys = set(store_keys)
-    for source_key, target_key in SOURCE_RETAILER_KEY_OVERRIDES.items():
-        if target_key in store_keys:
-            keys.add(source_key)
-    return sorted(keys)
+    first_id = int(rows[0]["id"])
+    # The backfill query is exclusive (id > start_id).
+    return max(0, first_id - 1)
 
 
 def run_cycle() -> dict:
-    store_keys = load_store_retailer_keys()
-    source_keys = source_keys_to_process(store_keys)
     week_start = latest_wednesday_start_utc() if WEEKLY_ONLY else None
-    created_after = week_start.isoformat() if week_start else None
 
-    logger.info(
-        "Starting cycle, source_keys=%s, store_keys=%s, created_after=%s",
-        len(source_keys),
-        len(store_keys),
-        created_after,
-    )
+    if week_start is not None:
+        start_id = _week_start_id(week_start)
+        logger.info(
+            "Starting global weekly cycle, week_start=%s, start_id=%s",
+            week_start.isoformat(),
+            start_id,
+        )
+        # Important: do not also add created_at or retailer_key filters here.
+        # The efficient production path is the existing partial index
+        # idx_flyer_deals_unmatched_id (id WHERE store_id IS NULL), starting at
+        # the current week's ID boundary. The matcher itself keeps retailer_key
+        # authoritative and loads only same-retailer store_locations candidates.
+        stats = run_backfill(
+            retailer_filter=None,
+            only_unmatched=True,
+            start_id=start_id,
+            created_after=None,
+        )
+    else:
+        logger.info("Starting global all-history unmatched cycle")
+        stats = run_backfill(
+            retailer_filter=None,
+            only_unmatched=True,
+            start_id=0,
+            created_after=None,
+        )
 
     totals = {
-        "processed": 0,
-        "matched": 0,
-        "no_match": 0,
-        "errors": 0,
-        "retailers_with_matches": 0,
-        "retailer_failures": 0,
+        "processed": int(stats.get("processed", 0)),
+        "matched": int(stats.get("matched", 0)),
+        "no_match": int(stats.get("no_match", 0)),
+        "errors": int(stats.get("errors", 0)),
+        "pages": int(stats.get("pages", 0)),
+        "last_id": int(stats.get("last_id", 0)),
     }
-
-    for source_key in source_keys:
-        try:
-            stats = run_backfill(
-                retailer_filter=source_key,
-                only_unmatched=True,
-                created_after=created_after,
-            )
-        except Exception:
-            # A statement timeout or one retailer-specific failure should not
-            # restart the entire cycle and reload the full store catalog. Skip
-            # the failing retailer for this pass and retry it next cycle.
-            totals["errors"] += 1
-            totals["retailer_failures"] += 1
-            logger.exception(
-                "retailer=%s failed during backfill; continuing with next retailer",
-                source_key,
-            )
-            continue
-
-        totals["processed"] += int(stats.get("processed", 0))
-        totals["matched"] += int(stats.get("matched", 0))
-        totals["no_match"] += int(stats.get("no_match", 0))
-        totals["errors"] += int(stats.get("errors", 0))
-
-        if stats.get("matched", 0):
-            totals["retailers_with_matches"] += 1
-            logger.info(
-                "retailer=%s matched=%s processed=%s no_match=%s",
-                source_key,
-                stats.get("matched", 0),
-                stats.get("processed", 0),
-                stats.get("no_match", 0),
-            )
-
     logger.info("Cycle complete: %s", totals)
     return totals
 
