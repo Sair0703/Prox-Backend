@@ -7,6 +7,8 @@
 # - Never collapses distinct banners (QFC, Ralphs, Mariano's, FoodsCo, etc.).
 # - Never creates synthetic store_locations rows.
 # - Existing non-null store_id values are not overwritten unless --all-rows is used.
+# - Does not write candidate_store_ids because the legacy DB column is uuid[]
+#   while public.store_locations.id is integer. store_id remains authoritative.
 #
 # Usage:
 #   PYTHONPATH=. python jobs/backfill_store_ids.py
@@ -68,16 +70,17 @@ def _fetch_page(
 
 
 def _build_payload(match) -> dict:
+    # candidate_store_ids is intentionally omitted here. The current production
+    # column is uuid[] but public.store_locations.id, flyer_deals.store_id, and
+    # the matcher all use integer IDs. Including integer candidates causes
+    # Postgres to reject the entire PATCH, including the valid store_id.
+    # Keep the chosen store_id plus match metadata now. Candidate re-resolution
+    # can be restored after the candidate ID schema is migrated deliberately.
     return {
         "store_id": match.store_id,
         "match_confidence": match.match_confidence,
         "candidate_store_count": match.candidate_store_count,
         "matched_by": match.matched_by,
-        "candidate_store_ids": (
-            match.candidate_store_ids
-            if match.candidate_store_count > 1 and match.candidate_store_ids
-            else None
-        ),
     }
 
 
