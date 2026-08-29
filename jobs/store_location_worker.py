@@ -98,14 +98,28 @@ def run_cycle() -> dict:
         "no_match": 0,
         "errors": 0,
         "retailers_with_matches": 0,
+        "retailer_failures": 0,
     }
 
     for source_key in source_keys:
-        stats = run_backfill(
-            retailer_filter=source_key,
-            only_unmatched=True,
-            created_after=created_after,
-        )
+        try:
+            stats = run_backfill(
+                retailer_filter=source_key,
+                only_unmatched=True,
+                created_after=created_after,
+            )
+        except Exception:
+            # A statement timeout or one retailer-specific failure should not
+            # restart the entire cycle and reload the full store catalog. Skip
+            # the failing retailer for this pass and retry it next cycle.
+            totals["errors"] += 1
+            totals["retailer_failures"] += 1
+            logger.exception(
+                "retailer=%s failed during backfill; continuing with next retailer",
+                source_key,
+            )
+            continue
+
         totals["processed"] += int(stats.get("processed", 0))
         totals["matched"] += int(stats.get("matched", 0))
         totals["no_match"] += int(stats.get("no_match", 0))
